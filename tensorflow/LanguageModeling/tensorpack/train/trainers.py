@@ -453,10 +453,19 @@ class HorovodTrainer(SingleCostTrainer):
         with tf.name_scope("AllReduce"):
             for grad, var in grads:
                 if grad is not None:
+                    # Apply gradient compression using GRACE.
+                    import horovod.tensorflow as hvd
+                    from grace_dl.tensorflow.communicator.allgather import Allgather
+                    from grace_dl.tensorflow.compressor.topk import TopKCompressor
+                    from grace_dl.tensorflow.memory.residual import ResidualMemory
+
+                    world_size = hvd.size()
+                    grc = Allgather(TopKCompressor(0.3), ResidualMemory(), world_size)
+
                     if self._compression is not None and self._has_compression:
-                        avg_grad = self.hvd.allreduce(grad, average=self._average, compression=self._compression)
+                        avg_grad = self.hvd.allreduce(grad, grace=grc, average=self._average, compression=self._compression)
                     else:
-                        avg_grad = self.hvd.allreduce(grad, average=self._average)
+                        avg_grad = self.hvd.allreduce(grad, grace=grc, average=self._average)
                     averaged_gradients.append((avg_grad, var))
                 else:
                     averaged_gradients.append((None, var))

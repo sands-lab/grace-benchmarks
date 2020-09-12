@@ -44,8 +44,8 @@ from mpi4py import MPI
 from neumf import ncf_model_ops
 from input_pipeline import DataGenerator
 
-import dllogger
-
+from logger.logger import LOGGER
+from logger.autologging import log_args
 
 def parse_args():
     """
@@ -72,13 +72,15 @@ def parse_args():
                         help='learning rate for optimizer')
     parser.add_argument('-k', '--topk', type=int, default=10,
                         help='rank for test examples to be considered a hit')
-    parser.add_argument('--seed', '-s', type=int, default=None,
+    parser.add_argument('--seed', '-s', type=int, default=0,
                         help='manually set random seed for random number generation')
     parser.add_argument('--target', '-t', type=float, default=0.9562,
                         help='stop training early at target')
-    parser.add_argument('--amp', action='store_true', dest='amp', default=False,
+    parser.add_argument('--fp16', action='store_true', dest='amp',
                         help='enable half-precision computations using automatic mixed precision \
                               (only available in supported containers)')
+    parser.add_argument('--manual-fp16', action='store_true', dest='fp16',
+                        help='manually enable mixed precision using code changes')
     parser.add_argument('--xla', action='store_true',
                         help='enable TensorFlow XLA (Accelerated Linear Algebra)')
     parser.add_argument('--valid-negative', type=int, default=100,
@@ -93,8 +95,9 @@ def parse_args():
                         help='Dropout probability, if equal to 0 will not use dropout at all')
     parser.add_argument('--loss-scale', default=8192, type=int,
                         help='Loss scale value to use when manually enabling mixed precision')
-    parser.add_argument('--checkpoint-dir', default=None, type=str,
-                        help='Path to the store the result checkpoint file for training')
+    parser.add_argument('--checkpoint-dir', default='/data/checkpoints/', type=str,
+                        help='Path to the store the result checkpoint file for training, \
+                              or to read from for evaluation')
     parser.add_argument('--load-checkpoint-path', default=None, type=str,
                         help='Path to the checkpoint for initialization. If None will initialize with random weights')
     parser.add_argument('--mode', choices=['train', 'test'], default='train', type=str,
@@ -102,11 +105,10 @@ def parse_args():
                               otherwise full training will be performed')
     parser.add_argument('--eval-after', type=int, default=8,
                         help='Perform evaluations only after this many epochs')
-    parser.add_argument('--log-path', default='log.json', type=str,
-                        help='Path for the JSON training log')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Log the performance and accuracy after every epoch')
 
     return parser.parse_args()
-
 
 def hvd_init():
     """
@@ -121,7 +123,6 @@ def hvd_init():
     if hvd.rank() == 0:
         print('PY', sys.version)
         print('TF', tf.__version__)
-
 
 def get_local_train_data(pos_train_users, pos_train_items, negative_samples):
     """
@@ -147,7 +148,6 @@ def get_local_train_data(pos_train_users, pos_train_items, negative_samples):
 
     return local_train_users, local_train_items, local_train_labels
 
-
 def get_local_test_data(pos_test_users, pos_test_items):
     """
     For distributed, split up the test data and only keep the local portion
@@ -162,45 +162,37 @@ def get_local_test_data(pos_test_users, pos_test_items):
 
     return local_test_users, local_test_items
 
-
 def main():
+    """
+    Run training/evaluation
+    """
     script_start = time.time()
     hvd_init()
     mpi_comm = MPI.COMM_WORLD
     args = parse_args()
 
     if hvd.rank() == 0:
-        dllogger.init(backends=[dllogger.JSONStreamBackend(verbosity=dllogger.Verbosity.VERBOSE,
-                                                           filename=args.log_path),
-                                dllogger.StdOutBackend(verbosity=dllogger.Verbosity.VERBOSE)])
-    else:
-        dllogger.init(backends=[])
+        log_args(args)
 
-    args.world_size = hvd.size()
-    dllogger.log(data=vars(args), step='PARAMETER')
-
-    if args.seed is None:
-        if hvd.rank() == 0:
-            seed = int(time.time())
-        else:
-            seed = None
-
-        seed = mpi_comm.bcast(seed, root=0)
-    else:
-        seed = args.seed
-
-    tf.random.set_random_seed(seed)
-    np.random.seed(seed)
-    cp.random.seed(seed)
+    if args.seed is not None:
+        tf.random.set_random_seed(args.seed)
+        np.random.seed(args.seed)
+        cp.random.seed(args.seed)
 
     if args.amp:
         os.environ["TF_ENABLE_AUTO_MIXED_PRECISION"] = "1"
+    if "TF_ENABLE_AUTO_MIXED_PRECISION" in os.environ \
+       and os.environ["TF_ENABLE_AUTO_MIXED_PRECISION"] == "1":
+        args.fp16 = False
 
-    if args.checkpoint_dir is not None:
+    # directory to store/read final checkpoint
+    if args.mode == 'train' and hvd.rank() == 0:
+        print("Saving best checkpoint to {}".format(args.checkpoint_dir))
+    elif hvd.rank() == 0:
+        print("Reading checkpoint: {}".format(args.checkpoint_dir))
+    if not os.path.exists(args.checkpoint_dir) and args.checkpoint_dir != '':
         os.makedirs(args.checkpoint_dir, exist_ok=True)
-        final_checkpoint_path = os.path.join(args.checkpoint_dir, 'model.ckpt')
-    else:
-        final_checkpoint_path = None
+    final_checkpoint_path = os.path.join(args.checkpoint_dir, 'model.ckpt')
 
     # Load converted data and get statistics
     train_df = pd.read_pickle(args.data+'/train_ratings.pickle')
@@ -227,7 +219,7 @@ def main():
     # Create and run Data Generator in a separate thread
     data_generator = DataGenerator(
         args.seed,
-        hvd.rank(),
+        hvd.local_rank(),
         nb_users,
         nb_items,
         neg_mat,
@@ -263,6 +255,7 @@ def main():
         labels,
         is_dup,
         params={
+            'fp16': args.fp16,
             'val_batch_size': args.valid_negative+1,
             'top_k': args.topk,
             'learning_rate': args.learning_rate,
@@ -315,20 +308,26 @@ def main():
         eval_duration = time.time() - eval_start
 
         # Report results
-        hit_rate_sum = sess.run(hvd.allreduce(hr_sum, average=False))
-        hit_rate_cnt = sess.run(hvd.allreduce(hr_cnt, average=False))
-        ndcg_sum = sess.run(hvd.allreduce(ndcg_sum, average=False))
-        ndcg_cnt = sess.run(hvd.allreduce(ndcg_cnt, average=False))
+        # Apply gradient compression using GRACE.
+        from grace_dl.tensorflow.communicator.allreduce import Allreduce
+        from grace_dl.tensorflow.compressor.none import NoneCompressor
+        from grace_dl.tensorflow.memory.none import NoneMemory
+        grc = Allreduce(NoneCompressor(), NoneMemory())
+
+        hit_rate_sum = sess.run(hvd.allreduce(hr_sum, grace=grc, average=False))
+        hit_rate_cnt = sess.run(hvd.allreduce(hr_cnt, grace=grc, average=False))
+        ndcg_sum = sess.run(hvd.allreduce(ndcg_sum, grace=grc, average=False))
+        ndcg_cnt = sess.run(hvd.allreduce(ndcg_cnt, grace=grc, average=False))
 
         hit_rate = hit_rate_sum / hit_rate_cnt
         ndcg = ndcg_sum / ndcg_cnt
 
         if hvd.rank() == 0:
+            LOGGER.log("Eval Time: {:.4f}, HR: {:.4f}, NDCG: {:.4f}"
+                       .format(eval_duration, hit_rate, ndcg))
+
             eval_throughput = pos_test_users.shape[0] * (args.valid_negative + 1) / eval_duration
-            dllogger.log(step=tuple(), data={'eval_throughput': eval_throughput,
-                                             'eval_time': eval_duration,
-                                             'hr@10': float(hit_rate),
-                                             'ndcg': float(ndcg)})
+            LOGGER.log('Average Eval Throughput: {:.4f}'.format(eval_throughput))
         return
 
     # Performance Metrics
@@ -352,6 +351,8 @@ def main():
 
     # Begin training
     begin_train = time.time()
+    if hvd.rank() == 0:
+        LOGGER.log("Begin Training. Setup Time: {}".format(begin_train - script_start))
     for epoch in range(args.epochs):
         # Train for one epoch
         train_start = time.time()
@@ -369,7 +370,7 @@ def main():
                 }
             )
         train_duration = time.time() - train_start
-        # Only log "warm" epochs
+        ## Only log "warm" epochs
         if epoch >= 1:
             train_times.append(train_duration)
         # Evaluate
@@ -395,27 +396,32 @@ def main():
             local_ndcg_sum[0] = sess.run(ndcg_sum)
             local_ndcg_count[0] = sess.run(ndcg_cnt)
             # Reduce metrics across all workers
-
             mpi_comm.Reduce(local_hr_count, global_hr_count)
             mpi_comm.Reduce(local_hr_sum, global_hr_sum)
             mpi_comm.Reduce(local_ndcg_count, global_ndcg_count)
             mpi_comm.Reduce(local_ndcg_sum, global_ndcg_sum)
-
             # Calculate metrics
             hit_rate = global_hr_sum[0] / global_hr_count[0]
             ndcg = global_ndcg_sum[0] / global_ndcg_count[0]
 
             eval_duration = time.time() - eval_start
-            # Only log "warm" epochs
+
+            ## Only log "warm" epochs
             if epoch >= 1:
                 eval_times.append(eval_duration)
 
             if hvd.rank() == 0:
-                dllogger.log(step=(epoch,), data={
-                                'train_time': train_duration,
-                                'eval_time': eval_duration,
-                                'hr@10': hit_rate,
-                                'ndcg': ndcg})
+                if args.verbose:
+                    log_string = "Epoch: {:02d}, Train Time: {:.4f}, Eval Time: {:.4f}, HR: {:.4f}, NDCG: {:.4f}"
+                    LOGGER.log(
+                        log_string.format(
+                            epoch,
+                            train_duration,
+                            eval_duration,
+                            hit_rate,
+                            ndcg
+                        )
+                    )
 
                 # Update summary metrics
                 if hit_rate > args.target and first_to_target is None:
@@ -425,7 +431,19 @@ def main():
                     best_hr = hit_rate
                     best_epoch = epoch
                     time_to_best =  time.time() - begin_train
-                    if hit_rate > args.target and final_checkpoint_path:
+                    if not args.verbose:
+                        log_string = "New Best Epoch: {:02d}, Train Time: {:.4f}, Eval Time: {:.4f}, HR: {:.4f}, NDCG: {:.4f}"
+                        LOGGER.log(
+                            log_string.format(
+                                epoch,
+                                train_duration,
+                                eval_duration,
+                                hit_rate,
+                                ndcg
+                            )
+                        )
+                    # Save, if meets target
+                    if hit_rate > args.target:
                         saver.save(sess, final_checkpoint_path)
 
     # Final Summary
@@ -434,22 +452,27 @@ def main():
         train_throughputs = pos_train_users.shape[0]*(args.negative_samples+1) / train_times
         eval_times = np.array(eval_times)
         eval_throughputs = pos_test_users.shape[0]*(args.valid_negative+1) / eval_times
+        LOGGER.log(' ')
 
-        dllogger.log(step=tuple(), data={
-            'average_train_time_per_epoch': np.mean(train_times),
-            'average_train_throughput': np.mean(train_throughputs),
-            'average_eval_time_per_epoch': np.mean(eval_times),
-            'average_eval_throughput': np.mean(eval_throughputs),
-            'first_epoch_to_hit': first_to_target,
-            'time_to_train': time_to_train,
-            'time_to_best': time_to_best,
-            'best_hr': best_hr,
-            'best_epoch': best_epoch})
-        dllogger.flush()
+        LOGGER.log('batch_size: {}'.format(args.batch_size))
+        LOGGER.log('num_gpus: {}'.format(hvd.size()))
+        LOGGER.log('AMP: {}'.format(1 if args.amp else 0))
+        LOGGER.log('seed: {}'.format(args.seed))
+        LOGGER.log('Minimum Train Time per Epoch: {:.4f}'.format(np.min(train_times)))
+        LOGGER.log('Average Train Time per Epoch: {:.4f}'.format(np.mean(train_times)))
+        LOGGER.log('Average Train Throughput:     {:.4f}'.format(np.mean(train_throughputs)))
+        LOGGER.log('Minimum Eval Time per Epoch:  {:.4f}'.format(np.min(eval_times)))
+        LOGGER.log('Average Eval Time per Epoch:  {:.4f}'.format(np.mean(eval_times)))
+        LOGGER.log('Average Eval Throughput:      {:.4f}'.format(np.mean(eval_throughputs)))
+        LOGGER.log('First Epoch to hit:           {}'.format(first_to_target))
+        LOGGER.log('Time to Train:                {:.4f}'.format(time_to_train))
+        LOGGER.log('Time to Best:                 {:.4f}'.format(time_to_best))
+        LOGGER.log('Best HR:                      {:.4f}'.format(best_hr))
+        LOGGER.log('Best Epoch:                   {}'.format(best_epoch))
+
 
     sess.close()
     return
-
 
 if __name__ == '__main__':
     main()

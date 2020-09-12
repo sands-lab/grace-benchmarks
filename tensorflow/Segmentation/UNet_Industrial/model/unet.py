@@ -382,7 +382,14 @@ class UNet_v1(object):
                     )
 
                     if hvd_utils.is_using_hvd():
-                        opt = hvd.DistributedOptimizer(opt, device_dense='/gpu:0')
+                        # Apply gradient compression using GRACE.
+                        from grace_dl.tensorflow.communicator.allgather import Allgather
+                        from grace_dl.tensorflow.compressor.topk import TopKCompressor
+                        from grace_dl.tensorflow.memory.residual import ResidualMemory
+
+                        world_size = hvd.size()
+                        grc = Allgather(TopKCompressor(0.3), ResidualMemory(), world_size)
+                        opt = hvd.DistributedOptimizer(opt, grace=grc, device_dense='/gpu:0')
 
                     if params["apply_manual_loss_scaling"]:
 

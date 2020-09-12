@@ -3267,7 +3267,15 @@ class BenchmarkCNN(object):
         else:
           horovod_device = ''
         # All-reduce gradients using Horovod.
-        grads = [hvd.allreduce(grad, average=False, device_dense=horovod_device)
+        # Apply gradient compression using GRACE.
+        from grace_dl.tensorflow.communicator.allgather import Allgather
+        from grace_dl.tensorflow.compressor.topk import TopKCompressor
+        from grace_dl.tensorflow.memory.residual import ResidualMemory
+
+        world_size = hvd.size()
+        grc = Allgather(TopKCompressor(0.3), ResidualMemory(), world_size)
+
+        grads = [hvd.allreduce(grad, grace=grc, average=False, device_dense=horovod_device)
                  for grad in grads]
 
       if self.params.staged_vars:

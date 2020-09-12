@@ -161,7 +161,7 @@ def ncf_model_ops(users,
     beta_2 = params['beta_2']
     epsilon = params['epsilon']
     # Model params
-    fp16 = False
+    fp16 = params['fp16']
     nb_users = params['num_users']
     nb_items = params['num_items']
     mf_dim = params['num_factors']
@@ -233,7 +233,14 @@ def ncf_model_ops(users,
             optimizer = tf.contrib.mixed_precision.LossScaleOptimizer(optimizer, loss_scale_manager)
 
         # Horovod wrapper for distributed training
-        optimizer = hvd.DistributedOptimizer(optimizer)
+        # Apply gradient compression using GRACE.
+        from grace_dl.tensorflow.communicator.allgather import Allgather
+        from grace_dl.tensorflow.compressor.topk import TopKCompressor
+        from grace_dl.tensorflow.memory.residual import ResidualMemory
+
+        world_size = hvd.size()
+        grc = Allgather(TopKCompressor(0.3), ResidualMemory(), world_size)
+        optimizer = hvd.DistributedOptimizer(optimizer, grace=grc)
 
         # Update ops
         global_step = tf.train.get_global_step()

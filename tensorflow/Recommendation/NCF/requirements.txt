@@ -1,2 +1,2 @@
 pandas
--e git://github.com/NVIDIA/dllogger#egg=dllogger
+cupy
