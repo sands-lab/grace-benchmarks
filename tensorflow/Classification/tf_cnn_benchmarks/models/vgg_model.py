@@ -56,6 +56,28 @@ def _construct_vgg(cnn, num_conv_layers):
   cnn.dropout()
 
 
+def _construct_vgg_cifar(cnn, num_conv_layers):
+  """Build vgg architecture from blocks."""
+  assert len(num_conv_layers) == 5
+  for _ in xrange(num_conv_layers[0]):
+    cnn.conv(64, 3, 3)
+  cnn.mpool(2, 2)
+  for _ in xrange(num_conv_layers[1]):
+    cnn.conv(128, 3, 3)
+  cnn.mpool(2, 2)
+  for _ in xrange(num_conv_layers[2]):
+    cnn.conv(256, 3, 3)
+  cnn.mpool(2, 2)
+  for _ in xrange(num_conv_layers[3]):
+    cnn.conv(512, 3, 3)
+  cnn.mpool(2, 2)
+  for _ in xrange(num_conv_layers[4]):
+    cnn.conv(512, 3, 3)
+  cnn.mpool(1, 1)
+  cnn.reshape([-1, 512])
+  cnn.affine(512)
+
+
 class Vgg11Model(model.CNNModel):
 
   def __init__(self, params=None):
@@ -81,3 +103,12 @@ class Vgg19Model(model.CNNModel):
 
   def add_inference(self, cnn):
     _construct_vgg(cnn, [2, 2, 4, 4, 4])
+
+
+class Vgg16Model_cifar10(model.CNNModel):
+
+  def __init__(self, params=None):
+    super(Vgg16Model_cifar10, self).__init__('vgg16_cifar', 32, 256, 0.1, params=params)
+
+  def add_inference(self, cnn):
+    _construct_vgg_cifar(cnn, [2, 2, 3, 3, 3])

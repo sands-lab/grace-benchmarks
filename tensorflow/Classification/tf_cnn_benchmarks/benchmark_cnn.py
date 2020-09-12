@@ -37,9 +37,8 @@ import numpy as np
 
 import six
 from six.moves import xrange  # pylint: disable=redefined-builtin
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 
-# pylint: disable=g-direct-tensorflow-import
 import cnn_util
 import constants
 import datasets
@@ -60,6 +59,7 @@ from tensorflow.python.framework import importer
 from tensorflow.python.ops import data_flow_ops
 from tensorflow.python.platform import gfile
 from tensorflow.python.util import nest
+# import wandb
 
 
 _DEFAULT_NUM_BATCHES = 100
@@ -212,7 +212,7 @@ flags.DEFINE_string('resize_method', 'bilinear',
                     'a round-robin fashion. Other modes support any sizes and '
                     'apply random bbox distortions before resizing (even with '
                     'distortions=False).')
-flags.DEFINE_boolean('distortions', False,
+flags.DEFINE_boolean('distortions', True,
                      'Enable/disable distortions during image preprocessing. '
                      'These include bbox and color distortions.')
 flags.DEFINE_boolean('use_datasets', True,
@@ -562,7 +562,7 @@ flags.DEFINE_integer('fp16_inc_loss_scale_every_n', 1000,
 #       an MPI framework (e.g. Open MPI). Each worker runs training on
 #       single GPU, and averages gradients using NCCL or MPI all-reduce.
 #       See https://github.com/uber/horovod for more details.
-flags.DEFINE_enum('variable_update', 'parameter_server',
+flags.DEFINE_enum('variable_update', 'horovod',
                   ('parameter_server', 'replicated', 'distributed_replicated',
                    'independent', 'distributed_all_reduce',
                    'collective_all_reduce', 'horovod'),
@@ -672,6 +672,12 @@ flags.DEFINE_string('benchmark_test_id', None,
                     'different test runs. This flag is designed for human '
                     'consumption, and does not have any impact within the '
                     'system.')
+
+flags.DEFINE_boolean('custom_learning_rate_schedule', False,
+                     'linearly increase to 0.4 until 5 epochs, then decrease linearly to 0 until the end')
+
+flags.DEFINE_boolean('cosine_learning_rate_schedule', False,
+                     'decrease from init_learning_rate to 0 with cosine wave')
 
 platforms_util.define_platform_params()
 
@@ -887,6 +893,7 @@ def benchmark_one_step(sess,
         step + 1,
         get_perf_timing_str(speed_mean, speed_uncertainty, speed_jitter),
         LOSS_AND_ACCURACY_DIGITS_TO_SHOW, lossval)
+    # wandb.log({"local_images_per_second": speed_mean}, step=step + 1)
     if 'top_1_accuracy' in results:
       log_str += '\t%.*f\t%.*f' % (
           LOSS_AND_ACCURACY_DIGITS_TO_SHOW, results['top_1_accuracy'],
@@ -935,10 +942,10 @@ def benchmark_one_step(sess,
 def get_perf_timing_str(speed_mean, speed_uncertainty, speed_jitter, scale=1):
   if scale == 1:
     # TODO(laigd): rename 'images' to maybe 'inputs', same below.
-    return ('images/sec: %.1f +/- %.1f (jitter = %.1f)' %
-            (speed_mean, speed_uncertainty, speed_jitter))
+    return ('images/sec: %.1f +/- %.1f (jitter = %.1f) %f' %
+            (speed_mean, speed_uncertainty, speed_jitter, time.time()))
   else:
-    return 'images/sec: %.1f' % speed_mean
+    return 'images/sec: %.1f %f' % (speed_mean, time.time())
 
 
 def get_perf_timing(batch_size, step_train_times, ewma_alpha=None, scale=1):
@@ -1156,7 +1163,7 @@ def get_piecewise_learning_rate(piecewise_learning_rate_schedule,
 
 
 def get_learning_rate(params, global_step, num_examples_per_epoch, model,
-                      batch_size):
+                      batch_size, num_workers):
   """Returns a learning rate tensor based on global_step.
 
   Args:
@@ -1178,7 +1185,23 @@ def get_learning_rate(params, global_step, num_examples_per_epoch, model,
   with tf.name_scope('learning_rate'):
     num_batches_per_epoch = num_examples_per_epoch / batch_size
 
-    if params.piecewise_learning_rate_schedule:
+    if params.custom_learning_rate_schedule:
+      # linearly increase to 0.4 until 5 epochs, then decrease linearly to 0 until the end
+      warmup_steps = int(num_batches_per_epoch * 5)
+      warmup_lr = 0.4 * tf.cast(global_step, tf.float32) / tf.cast(warmup_steps, tf.float32)
+      total_num_steps, _ = get_num_batches_and_epochs(params, batch_size, num_examples_per_epoch)
+      slope = tf.cast(global_step - warmup_steps, tf.float32) / tf.cast(total_num_steps - warmup_steps, tf.float32)
+      lr = 0.4 * (1. - slope)
+      learning_rate = tf.cond(global_step < warmup_steps,
+                              lambda: warmup_lr, lambda: lr)
+    elif params.cosine_learning_rate_schedule:
+      # decrease from init_learning_rate to 0 with cosine wave
+      total_num_steps, _ = get_num_batches_and_epochs(params, batch_size, num_examples_per_epoch)
+      rescaled_lr = params.init_learning_rate * (batch_size / 256.0)
+      # num_decay_steps = (num_examples_per_epoch // batch_size) * num_epochs
+      learning_rate = tf.train.cosine_decay(rescaled_lr, global_step, total_num_steps)
+
+    elif params.piecewise_learning_rate_schedule:
       if (params.init_learning_rate is not None or
           params.learning_rate_decay_factor or
           params.minimum_learning_rate or params.num_epochs_per_decay):
@@ -1212,7 +1235,7 @@ def get_learning_rate(params, global_step, num_examples_per_epoch, model,
         params.piecewise_learning_rate_schedule):
       warmup_steps = int(num_batches_per_epoch *
                          params.num_learning_rate_warmup_epochs)
-      init_lr = params.init_learning_rate
+      init_lr = params.init_learning_rate * (batch_size / 256.0) if params.cosine_learning_rate_schedule else params.init_learning_rate
       if init_lr is None:
         init_lr = float(params.piecewise_learning_rate_schedule.split(';')[0])
       warmup_lr = init_lr * tf.cast(global_step, tf.float32) / tf.cast(
@@ -1223,7 +1246,6 @@ def get_learning_rate(params, global_step, num_examples_per_epoch, model,
     learning_rate = mlperf.logger.log_deferred_tensor_value(
         mlperf.tags.OPT_LR, learning_rate, global_step, every_n=100)
   return learning_rate
-
 
 def get_optimizer(params, learning_rate):
   """Returns the optimizer that should be used based on params."""
@@ -2033,8 +2055,8 @@ class BenchmarkCNN(object):
                             simple_value=result_value)
       if summary_writer:
         summary_writer.add_summary(summary, global_step)
-      log_fn('Accuracy @ 1 = %.4f Accuracy @ 5 = %.4f [%d examples]' %
-             (accuracy_at_1, accuracy_at_5, total_eval_count))
+      log_fn('Accuracy @ 1 = %.4f Accuracy @ 5 = %.4f [%d examples] %f' %
+             (accuracy_at_1, accuracy_at_5, total_eval_count, time.time()))
       elapsed_time = loop_end_time - loop_start_time
       images_per_sec = (self.num_batches * self.batch_size / elapsed_time)
       if self.mode != constants.BenchmarkMode.TRAIN_AND_EVAL:
@@ -2511,6 +2533,7 @@ class BenchmarkCNN(object):
     num_epochs_ran = (python_global_step * self.batch_size /
                       self.dataset.num_examples_per_epoch('train'))
     mlperf.logger.log_train_epochs(num_epochs_ran)
+    # wandb.log({"total_images_per_sec": images_per_sec})
     if image_producer is not None:
       image_producer.done()
     if eval_image_producer is not None:
@@ -2626,7 +2649,7 @@ class BenchmarkCNN(object):
     if self.params.trt_mode:
       # Import here instead of at top, because this will crash if TensorRT is
       # not installed
-      from tensorflow.python.compiler.tensorrt import trt_convert  # pylint: disable=g-import-not-at-top
+      from tensorflow.contrib import tensorrt as trt  # pylint: disable=g-import-not-at-top
       # Avoid TF-TRT bridge from touching all variable initializer ops and their
       # dependencies, since they can directly be fetched by sess.run()s that
       # initialize the variables.
@@ -2637,7 +2660,7 @@ class BenchmarkCNN(object):
           variable_initializers, name_to_input_name)
       # pylint: enable=protected-access
 
-      graphdef = trt_convert.create_inference_graph(
+      graphdef = trt.create_inference_graph(
           graphdef,
           outputs=output_node_names + list(initializer_subgraph_ops),
           max_batch_size=self.model.get_batch_size(),
@@ -2927,7 +2950,7 @@ class BenchmarkCNN(object):
       with tf.device(self.cpu_device):
         learning_rate = get_learning_rate(self.params, global_step,
                                           self.dataset.num_examples_per_epoch(),
-                                          self.model, examples_per_step)
+                                          self.model, examples_per_step, self.num_workers)
 
     training_ops = []
     for d, device in enumerate(apply_gradient_devices):
@@ -2943,7 +2966,7 @@ class BenchmarkCNN(object):
           # `apply_gradient_devices`.
           learning_rate = get_learning_rate(
               self.params, global_step, self.dataset.num_examples_per_epoch(),
-              self.model, examples_per_step)
+              self.model, examples_per_step, self.num_workers)
         gradient_clip = self.params.gradient_clip
         if gradient_clip is not None:
           with tf.name_scope('clip_gradients'):
@@ -3172,7 +3195,9 @@ class BenchmarkCNN(object):
         for i in range(len(input_list))
     ]
 
+    #print_once = True
     def forward_pass_and_gradients():
+      #global print_once
       """Builds forward pass and gradient computation network.
 
       When phase_train=True and print_training_accuracy=False:
@@ -3266,14 +3291,18 @@ class BenchmarkCNN(object):
           horovod_device = '/%s:0' % self.params.horovod_device
         else:
           horovod_device = ''
+
         # All-reduce gradients using Horovod.
         # Apply gradient compression using GRACE.
         from grace_dl.tensorflow.communicator.allgather import Allgather
         from grace_dl.tensorflow.compressor.topk import TopKCompressor
         from grace_dl.tensorflow.memory.residual import ResidualMemory
+        from grace_dl.tensorflow.communicator.allreduce import Allreduce
+        from grace_dl.tensorflow.compressor.none import NoneCompressor
 
         world_size = hvd.size()
-        grc = Allgather(TopKCompressor(0.3), ResidualMemory(), world_size)
+        grc = Allgather(TopKCompressor(0.01), ResidualMemory(), world_size)
+        # grc = Allreduce(NoneCompressor(), NoneMemory(), world_size)
 
         grads = [hvd.allreduce(grad, grace=grc, average=False, device_dense=horovod_device)
                  for grad in grads]
@@ -3525,7 +3554,17 @@ def setup(params):
   if params.variable_update == 'horovod':
     import horovod.tensorflow as hvd  # pylint: disable=g-import-not-at-top
     hvd.init()
-
+  # import horovod.tensorflow as hvd  # pylint: disable=g-import-not-at-top
+  # hvd.init()
+  # if hvd.rank()!=0:
+  #   os.environ['WANDB_MODE'] = 'dryrun'
+  # wandb_id = os.environ.get('WANDB_ID', None)
+  # if wandb_id is None:
+  #   wandb.init(config=params._asdict())
+  # else:
+  #   wandb.init(config=params._asdict(), id=f"{wandb_id}{hvd.rank()}")
+  # wandb.config.update({'SLURM_JOB_ID': os.environ.get('SLURM_JOB_ID', None)})
+  # wandb.tensorboard.patch(save=False)
   platforms_util.initialize(params, create_config_proto(params))
 
   if not params.job_name:
@@ -3548,3 +3587,4 @@ def maybe_compile(computation, params):
     return tf.xla.experimental.compile(computation)
   else:
     return computation()
+

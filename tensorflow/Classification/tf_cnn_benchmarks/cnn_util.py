@@ -22,7 +22,7 @@ import sys
 import threading
 
 import numpy as np
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 
 
 def tensorflow_version_tuple():

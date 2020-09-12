@@ -22,7 +22,7 @@ import itertools as it
 import math
 
 import numpy as np
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 
 from object_detection.box_coders import faster_rcnn_box_coder
 from object_detection.core import box_list

@@ -26,7 +26,7 @@ import numpy as np
 import six
 from six.moves import cPickle
 from six.moves import xrange  # pylint: disable=redefined-builtin
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 
 from tensorflow.python.platform import gfile
 import preprocessing

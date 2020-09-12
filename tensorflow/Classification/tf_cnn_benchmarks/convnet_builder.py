@@ -23,18 +23,13 @@ import contextlib
 
 import numpy as np
 
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 
-# pylint: disable=g-direct-tensorflow-import
-import mlperf
 from tensorflow.python.layers import convolutional as conv_layers
 from tensorflow.python.layers import core as core_layers
-from tensorflow.python.layers import normalization as normalization_layers
 from tensorflow.python.layers import pooling as pooling_layers
 from tensorflow.python.training import moving_averages
-
-
-_data_format_to_channel_axis = {'NCHW': 1, 'NHWC': 3}
+import mlperf
 
 
 class ConvNetBuilder(object):
@@ -466,19 +461,16 @@ class ConvNetBuilder(object):
     center = True
     with tf.variable_scope(name) as scope:
       if self.use_tf_layers:
-        layer_obj = normalization_layers.BatchNormalization(
-            momentum=decay,
+        bn = tf.contrib.layers.batch_norm(
+            input_layer,
+            decay=decay,
             scale=scale,
             epsilon=epsilon,
+            is_training=self.phase_train,
             fused=True,
-            axis=_data_format_to_channel_axis[self.data_format],
-            # We pass this 'scope' argument for compatibility with checkpoints
-            # created with the contrib version of batch norm. tf_cnn_benchmarks
-            # used to use the contrib version.
-            _scope=scope,
-            center=center,
-            name=scope.name)
-        bn = layer_obj.apply(input_layer, training=self.phase_train)
+            data_format=self.data_format,
+            scope=scope,
+            center=center)
       else:
         bn = self._batch_norm_without_layers(input_layer, decay, scale, epsilon)
     self.top_layer = bn

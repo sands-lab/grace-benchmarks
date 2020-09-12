@@ -25,7 +25,7 @@ from __future__ import print_function
 
 import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 from models import model as model_lib
 
 
@@ -88,13 +88,13 @@ class DensenetCifar10Model(model_lib.CNNModel):
     return tf.train.piecewise_constant(global_step, boundaries, values)
 
 
-def create_densenet40_k12_model():
-  return DensenetCifar10Model('densenet40_k12', (12, 12, 12), 12)
+def create_densenet40_k12_model(params):
+  return DensenetCifar10Model('densenet40_k12', (12, 12, 12), 12, params=params)
 
 
-def create_densenet100_k12_model():
-  return DensenetCifar10Model('densenet100_k12', (32, 32, 32), 12)
+def create_densenet100_k12_model(params):
+  return DensenetCifar10Model('densenet100_k12', (32, 32, 32), 12, params=params)
 
 
-def create_densenet100_k24_model():
-  return DensenetCifar10Model('densenet100_k24', (32, 32, 32), 24)
+def create_densenet100_k24_model(params):
+  return DensenetCifar10Model('densenet100_k24', (32, 32, 32), 24, params=params)
